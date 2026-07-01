@@ -1,0 +1,13 @@
+# Install torch separately with the CUDA index URL:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch
+torchvision
+fastapi
+uvicorn[standard]
+requests
+Pillow
+numpy
+redis
+opencv-python-headless
+huggingface-hub
+transformers>=4.52.0

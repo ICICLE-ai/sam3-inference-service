@@ -1,0 +1,24 @@
+# INGRESS for Public Access (NRP-specific haproxy class)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sam3-ingress
+  annotations:
+    haproxy-ingress.github.io/timeout-server: "300s"
+    haproxy-ingress.github.io/timeout-connect: "300s"
+spec:
+  ingressClassName: haproxy
+  rules:
+  - host: sam3-sailab.nrp-nautilus.io
+    http:
+      paths:
+      - backend:
+          service:
+            name: sam3-service
+            port:
+              number: 80
+        path: /
+        pathType: ImplementationSpecific
+  tls:
+  - hosts:
+    - sam3-sailab.nrp-nautilus.io

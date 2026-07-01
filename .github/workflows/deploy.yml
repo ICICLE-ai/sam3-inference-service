@@ -1,0 +1,80 @@
+name: Deploy
+
+on:
+  # Trigger manually from the GitHub UI with an optional image tag override
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag to deploy (e.g. sha-abc1234 or main)"
+        required: false
+        default: "main"
+
+  # Auto-deploy when the Build & Push workflow succeeds on main
+  workflow_run:
+    workflows: ["Build & Push"]
+    branches: [main]
+    types:
+      - completed
+
+jobs:
+  deploy:
+    name: Deploy to NRP Nautilus (Kubernetes)
+    runs-on: ubuntu-latest
+    # Skip if triggered by a failed build
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    # Require manual approval via a GitHub Environment for production safety
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          printf '%s' "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            # Use the short SHA of the commit that triggered the upstream build
+            SHORT_SHA=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
+            echo "value=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / refresh HF_TOKEN secret
+        run: |
+          kubectl create secret generic sam3-secrets \
+            --from-literal=HF_TOKEN="${{ secrets.HF_TOKEN }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply Kubernetes manifests
+        run: kubectl apply -f sam3_nrp_deployment.yaml
+
+      - name: Update container image to ${{ steps.tag.outputs.value }}
+        run: |
+          kubectl set image deployment/sam3-fastapi \
+            api=brijeshnanda/annotation_assistor:${{ steps.tag.outputs.value }}
+
+      - name: Wait for Redis to be ready
+        run: kubectl rollout status deployment/redis-server --timeout=300s
+
+      - name: Wait for SAM3 to be ready
+        run: kubectl rollout status deployment/sam3-fastapi --timeout=600s
+
+      - name: Deployment summary
+        run: |
+          echo "### Deployed: brijeshnanda/annotation_assistor:${{ steps.tag.outputs.value }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          kubectl get pods -o wide >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "URL: https://sam3-sailab.nrp-nautilus.io" >> "$GITHUB_STEP_SUMMARY"
