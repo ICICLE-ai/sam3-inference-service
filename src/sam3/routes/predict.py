@@ -13,11 +13,13 @@ from sam3.image_utils import (
 )
 from sam3.inference import (
     encode_and_store_tracker_embeddings,
+    run_box_exemplar_inference_on_image,
     run_point_inference_on_image,
     run_text_inference_on_image,
 )
 from sam3.models import (
     BoundingBox,
+    ExemplarRequest,
     LegacyPointRequest,
     SegmentationRequest,
     SegmentationResponse,
@@ -307,6 +309,99 @@ async def _predict_point_cached(
         model="SAM3-Tracker",
         total_time_seconds=round(time.time() - start_time, 4),
     )
+
+
+@router.post("/predict_exemplar", response_model=SegmentationResponse)
+async def predict_exemplar(
+    req: ExemplarRequest,
+    token: str = Header(None, alias="token"),
+):
+    """Detect all objects similar to the supplied exemplar bounding box."""
+    start_time = time.time()
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Token required to fetch image")
+
+    try:
+        raw_image = fetch_image_from_tapis(req.system_id, req.image_path, token)
+
+        x1, y1, x2, y2 = req.exemplar_box
+        if x2 > raw_image.width or y2 > raw_image.height:
+            raise HTTPException(
+                status_code=400,
+                detail="exemplar_box extends outside image bounds",
+            )
+
+        if req.patch_size is not None:
+            tile_coords = build_overlapping_tiles(
+                raw_image.width, raw_image.height, req.patch_size, req.overlap_ratio
+            )
+            print(
+                f"Tiled exemplar inference: {len(tile_coords)} tiles, "
+                f"patch_size={req.patch_size}, overlap_ratio={req.overlap_ratio}"
+            )
+        else:
+            tile_coords = [(0, 0, raw_image.width, raw_image.height)]
+
+        candidates: list[dict] = []
+        label = f"exemplar({x1},{y1},{x2},{y2})"
+
+        for tx1, ty1, tx2, ty2 in tile_coords:
+            tile_img = raw_image.crop((tx1, ty1, tx2, ty2))
+
+            # Translate the exemplar box into tile-local coordinates and skip
+            # tiles that don't contain the exemplar at all.
+            local_ex1 = max(x1 - tx1, 0)
+            local_ey1 = max(y1 - ty1, 0)
+            local_ex2 = min(x2 - tx1, tx2 - tx1)
+            local_ey2 = min(y2 - ty1, ty2 - ty1)
+
+            if local_ex2 <= local_ex1 or local_ey2 <= local_ey1:
+                # Exemplar falls outside this tile — use full exemplar crop directly
+                local_exemplar_box = (x1, y1, x2, y2)
+                exemplar_source = raw_image
+            else:
+                local_exemplar_box = (local_ex1, local_ey1, local_ex2, local_ey2)
+                exemplar_source = tile_img
+
+            tile_dets = run_box_exemplar_inference_on_image(
+                tile_img,
+                exemplar_box=local_exemplar_box,
+                threshold=req.threshold,
+                mask_threshold=req.mask_threshold,
+            )
+            for bx1, by1, bx2, by2, score, seg_pts in tile_dets:
+                candidates.append(
+                    {
+                        "x_min": int(bx1 + tx1),
+                        "y_min": int(by1 + ty1),
+                        "x_max": int(bx2 + tx1),
+                        "y_max": int(by2 + ty1),
+                        "confidence": round(score, 4),
+                        "label": label,
+                        "prompt_index": 0,
+                        "segmentation": [[px + tx1, py + ty1] for px, py in seg_pts],
+                    }
+                )
+
+        merged = nms_bbox_candidates(candidates, iou_threshold=0.5)
+        bboxes = [BoundingBox(**b) for b in merged]
+        torch.cuda.empty_cache()
+
+        return SegmentationResponse(
+            bboxes=bboxes,
+            prompt_type="exemplar",
+            prompt_count=1,
+            total_detections=len(bboxes),
+            model="SAM3-Concept",
+            total_time_seconds=round(time.time() - start_time, 4),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Inference Error: {str(e)}")
 
 
 def _load_valid_embedding(cache_key: str) -> bytes | None:
