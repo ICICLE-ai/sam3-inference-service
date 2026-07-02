@@ -19,7 +19,7 @@ spec:
         command:
           - redis-server
           - --maxmemory
-          - "128gb"
+          - "48gb"
           - --maxmemory-policy
           - allkeys-lru
         ports:
@@ -27,10 +27,10 @@ spec:
         resources:
           requests:
             cpu: "1"
-            memory: "128Gi"
+            memory: "48Gi"
           limits:
             cpu: "1"
-            memory: "128Gi"
+            memory: "48Gi"
 ---
 # REDIS SERVICE (internal ClusterIP — reachable as "redis-service" within the namespace)
 apiVersion: v1
