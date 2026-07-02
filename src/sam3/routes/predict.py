@@ -89,6 +89,8 @@ async def predict_box_legacy(
 async def _predict_with_text_batch(
     req: SegmentationRequest, token: str, start_time: float
 ) -> SegmentationResponse:
+    if req.text_prompts is None:
+        raise HTTPException(status_code=400, detail="text_prompts is required")
     if not token:
         raise HTTPException(status_code=400, detail="Token required to fetch image")
 
@@ -185,6 +187,8 @@ async def _predict_point_cropped(
         )
 
     raw_image = fetch_image_from_tapis(req.system_id, req.image_path, token)
+    if req.x is None or req.y is None:
+        raise HTTPException(status_code=400, detail="Point coordinates are required")
     if req.x < 0 or req.y < 0 or req.x >= raw_image.width or req.y >= raw_image.height:
         raise HTTPException(
             status_code=400, detail="Point coordinates are out of image bounds"
@@ -238,7 +242,10 @@ async def _predict_point_cached(
         print(f"Load Image: {time.time() - step_start:.4f}s")
 
         await encode_and_store_tracker_embeddings(req.image_id, req.pipe_id, raw_image)
-        embedding_bytes = r.get(cache_key)
+        fresh = r.get(cache_key)
+        if not isinstance(fresh, bytes):
+            raise HTTPException(status_code=500, detail="Failed to cache embeddings")
+        embedding_bytes = fresh
 
     loaded_data = pickle.loads(embedding_bytes)
     loaded_embeddings = loaded_data["embeddings"]
@@ -305,7 +312,7 @@ async def _predict_point_cached(
 def _load_valid_embedding(cache_key: str) -> bytes | None:
     """Returns cached embedding bytes, or None if missing or corrupt."""
     raw = r.get(cache_key)
-    if raw is None:
+    if not isinstance(raw, bytes):
         return None
     try:
         data = pickle.loads(raw)

@@ -24,11 +24,11 @@ async def lifespan(app: FastAPI):
 
     try:
         print("Loading Sam3Model (Concept Segmentation)...")
-        sam3_model = Sam3Model.from_pretrained(MODEL_ID).to(DEVICE)
+        sam3_model = Sam3Model.from_pretrained(MODEL_ID).to(DEVICE)  # type: ignore[arg-type]
         sam3_processor = Sam3Processor.from_pretrained(MODEL_ID)
 
         print("Loading Sam3TrackerModel (Visual Segmentation)...")
-        sam3_tracker_model = Sam3TrackerModel.from_pretrained(MODEL_ID).to(DEVICE)
+        sam3_tracker_model = Sam3TrackerModel.from_pretrained(MODEL_ID).to(DEVICE)  # type: ignore[arg-type]
         sam3_tracker_processor = Sam3TrackerProcessor.from_pretrained(MODEL_ID)
 
         print("Both Models Loaded Successfully")
