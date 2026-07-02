@@ -1,0 +1,37 @@
+name: sam3
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+
+  # PyTorch — the pytorch channel picks the right variant automatically:
+  #   osx-arm64  → MPS-enabled build (Apple Silicon)
+  #   linux-64   → CPU-only unless pytorch-cuda is added (see note below)
+  - pytorch::pytorch
+  - pytorch::torchvision
+  # On Linux with a CUDA 12.4 GPU, uncomment the next line:
+  # - pytorch::pytorch-cuda=12.4
+
+  # Packages available on conda-forge
+  - conda-forge::fastapi
+  - conda-forge::uvicorn
+  - conda-forge::requests
+  - conda-forge::pillow
+  - conda-forge::numpy
+  - conda-forge::redis-py
+  - conda-forge::opencv
+
+  # Dev / test tooling
+  - conda-forge::pytest
+  - conda-forge::pyright
+
+  # Packages only on PyPI
+  - pip
+  - pip:
+      - "uvicorn[standard]"
+      - "huggingface-hub"
+      - "transformers>=4.52.0"
+      - "opencv-python-headless"  # headless variant not on conda-forge
