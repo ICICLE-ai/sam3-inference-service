@@ -5,8 +5,10 @@ from typing import Optional, List
 class SegmentationRequest(BaseModel):
     image_id: str
     pipe_id: str
-    system_id: str
-    image_path: str
+    # Where to fetch the image from Tapis. Not needed when the image is
+    # uploaded with the request (POST /predict/upload).
+    system_id: str | None = None
+    image_path: str | None = None
     text_prompts: list[str] | None = None
     x: int | None = None
     y: int | None = None

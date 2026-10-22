@@ -88,18 +88,20 @@ def run_box_exemplar_inference_on_image(
 ) -> list[tuple[int, int, int, int, float, list[list[int]]]]:
     """Uses a bounding-box crop as a visual exemplar to find all similar objects.
 
-    The exemplar_box region is cropped from raw_image and passed to the concept
-    model as a visual prompt (instead of text) so it can detect every instance
-    of the same object class across the image.
+    The exemplar_box is passed to the concept model as a positive box prompt
+    (instead of text) so it can detect every instance of the same object class
+    across the image.
 
     Returns list of (x1, y1, x2, y2, score, seg_points).
     """
     ex1, ey1, ex2, ey2 = exemplar_box
-    exemplar_crop = raw_image.crop((ex1, ey1, ex2, ey2))
 
+    # SAM3's concept model takes the exemplar as a box on the same image
+    # (input_boxes, pixel xyxy) with a positive label, not a cropped image.
     inputs = _models.sam3_processor(
         images=raw_image,
-        exemplar_images=[exemplar_crop],
+        input_boxes=[[[ex1, ey1, ex2, ey2]]],
+        input_boxes_labels=[[1]],
         return_tensors="pt",
     ).to(DEVICE)
 

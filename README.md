@@ -16,6 +16,8 @@ The service is implemented in [main.py](main.py), containerized with [Dockerfile
 - `POST /predict`
 	- Text mode: send `text_prompts`
 	- Point mode: send `x`, `y`
+- `POST /predict/upload`
+	- Same as `/predict`, but the image is uploaded as multipart form data instead of fetched from Tapis
 - `POST /predict_box` (legacy)
 	- Backward-compatible point endpoint
 
@@ -266,6 +268,28 @@ curl -X POST "http://localhost:2128/predict" \
 	}
 }
 ```
+
+## 7.1a `POST /predict/upload`
+
+For images that are not on Tapis, such as frames extracted by the video
+service. Multipart form with two fields:
+
+- `request`: the `/predict` body as a JSON string. `system_id` and `image_path` are not needed.
+- `file`: the image.
+
+No token is required. For point mode the embedding cache (keyed on `pipe_id` +
+`image_id`) is checked first: on a hit the uploaded file is discarded without
+being decoded; on a miss it is embedded and cached. Keep `image_id` unique per
+distinct image, or a cached embedding of one image is used for another.
+
+```bash
+curl -X POST "http://localhost:2128/predict/upload" \
+	-F 'request={"image_id":"up1_frame_000012","pipe_id":"pipe_456","x":320,"y":240}' \
+	-F "file=@frame_000012.jpg"
+```
+
+Returns the same response as `/predict`. An unreadable file is `400`; an
+invalid `request` is `422`.
 
 ## 7.2 `POST /predict_box` (legacy)
 
