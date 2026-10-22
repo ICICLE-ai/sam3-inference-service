@@ -80,6 +80,60 @@ def run_text_inference_on_image(
     return out
 
 
+def run_box_exemplar_inference_on_image(
+    raw_image: Image.Image,
+    exemplar_box: tuple[int, int, int, int],
+    threshold: float = 0.1,
+    mask_threshold: float = 0.1,
+) -> list[tuple[int, int, int, int, float, list[list[int]]]]:
+    """Uses a bounding-box crop as a visual exemplar to find all similar objects.
+
+    The exemplar_box is passed to the concept model as a positive box prompt
+    (instead of text) so it can detect every instance of the same object class
+    across the image.
+
+    Returns list of (x1, y1, x2, y2, score, seg_points).
+    """
+    ex1, ey1, ex2, ey2 = exemplar_box
+
+    # SAM3's concept model takes the exemplar as a box on the same image
+    # (input_boxes, pixel xyxy) with a positive label, not a cropped image.
+    inputs = _models.sam3_processor(
+        images=raw_image,
+        input_boxes=[[[ex1, ey1, ex2, ey2]]],
+        input_boxes_labels=[[1]],
+        return_tensors="pt",
+    ).to(DEVICE)
+
+    with torch.no_grad():
+        outputs = _models.sam3_model(**inputs)
+
+    target_sizes = inputs.get("original_sizes").tolist()
+    results = _models.sam3_processor.post_process_instance_segmentation(
+        outputs,
+        threshold=threshold,
+        mask_threshold=mask_threshold,
+        target_sizes=target_sizes,
+    )[0]
+
+    out = []
+    for i in range(len(results["masks"])):
+        box = results["boxes"][i]
+        score = float(results["scores"][i].item())
+        x_min, y_min, x_max, y_max = box.tolist()
+        mask = results["masks"][i]
+        mask_np = (
+            mask.cpu().numpy() > 0 if hasattr(mask, "numpy") else np.array(mask) > 0
+        )
+        out.append(
+            (int(x_min), int(y_min), int(x_max), int(y_max), score, mask_to_boundary_points(mask_np))
+        )
+
+    del inputs, outputs
+    torch.cuda.empty_cache()
+    return out
+
+
 def run_point_inference_on_image(
     raw_image: Image.Image, x: int, y: int
 ) -> tuple[int, int, int, int, float, list[list[int]]] | None:

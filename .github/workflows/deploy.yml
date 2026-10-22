@@ -35,9 +35,11 @@ jobs:
         uses: azure/setup-kubectl@v4
 
       - name: Configure kubeconfig
+        env:
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
         run: |
           mkdir -p ~/.kube
-          printf '%s' "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+          echo "$KUBECONFIG_DATA" | base64 -d > ~/.kube/config
           chmod 600 ~/.kube/config
 
       - name: Resolve image tag

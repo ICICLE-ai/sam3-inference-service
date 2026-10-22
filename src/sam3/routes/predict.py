@@ -1,9 +1,13 @@
+import io
 import pickle
 import time
 import traceback
+from typing import Callable
 
 import torch
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
+from PIL import Image, UnidentifiedImageError
+from pydantic import ValidationError
 
 from sam3.image_utils import (
     build_overlapping_tiles,
@@ -13,11 +17,13 @@ from sam3.image_utils import (
 )
 from sam3.inference import (
     encode_and_store_tracker_embeddings,
+    run_box_exemplar_inference_on_image,
     run_point_inference_on_image,
     run_text_inference_on_image,
 )
 from sam3.models import (
     BoundingBox,
+    ExemplarRequest,
     LegacyPointRequest,
     SegmentationRequest,
     SegmentationResponse,
@@ -28,12 +34,70 @@ from sam3.tapis import fetch_image_from_tapis
 
 router = APIRouter()
 
+# Produces the request's image on demand. Called only when the image is
+# actually needed, so a cached point request never fetches or decodes it.
+ImageLoader = Callable[[], Image.Image]
+
+
+def _tapis_loader(system_id: str | None, image_path: str | None, token: str | None) -> ImageLoader:
+    def load() -> Image.Image:
+        if not system_id or not image_path:
+            raise HTTPException(
+                status_code=400,
+                detail="system_id and image_path are required to fetch the image from Tapis",
+            )
+        if not token:
+            raise HTTPException(status_code=400, detail="Token required to fetch image")
+        step_start = time.time()
+        image = fetch_image_from_tapis(system_id, image_path, token)
+        print(f"Image Load: {time.time() - step_start:.4f}s")
+        return image
+    return load
+
+
+def _upload_loader(data: bytes) -> ImageLoader:
+    def load() -> Image.Image:
+        try:
+            return Image.open(io.BytesIO(data)).convert("RGB")
+        except UnidentifiedImageError:
+            raise HTTPException(status_code=400, detail="Uploaded file is not a readable image")
+    return load
+
 
 @router.post("/predict", response_model=SegmentationResponse)
 async def predict(
     req: SegmentationRequest,
     token: str = Header(None, alias="token"),
 ):
+    return await _predict(req, _tapis_loader(req.system_id, req.image_path, token))
+
+
+@router.post("/predict/upload", response_model=SegmentationResponse)
+async def predict_upload(
+    request: str = Form(..., description="SegmentationRequest as a JSON string"),
+    file: UploadFile = File(..., description="The image to segment"),
+):
+    """Same as /predict, but the image travels with the request instead of
+    being fetched from Tapis — for images that live nowhere else, such as
+    frames extracted by the video service.
+
+    For point prompts the embedding cache is checked first, keyed on
+    pipe_id + image_id exactly as /predict is: on a hit the uploaded file is
+    discarded unread, so callers can always send it without paying to
+    re-embed.
+    """
+    try:
+        req = SegmentationRequest.model_validate_json(request)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors(include_url=False))
+    try:
+        data = await file.read()
+    finally:
+        await file.close()
+    return await _predict(req, _upload_loader(data))
+
+
+async def _predict(req: SegmentationRequest, load_image: ImageLoader) -> SegmentationResponse:
     start_time = time.time()
 
     has_text = req.text_prompts is not None and len(req.text_prompts) > 0
@@ -53,8 +117,8 @@ async def predict(
 
     try:
         if has_text:
-            return await _predict_with_text_batch(req, token, start_time)
-        return await _predict_with_point(req, token, start_time)
+            return await _predict_with_text_batch(req, load_image, start_time)
+        return await _predict_with_point(req, load_image, start_time)
     except HTTPException:
         raise
     except Exception as e:
@@ -87,16 +151,12 @@ async def predict_box_legacy(
 
 
 async def _predict_with_text_batch(
-    req: SegmentationRequest, token: str, start_time: float
+    req: SegmentationRequest, load_image: ImageLoader, start_time: float
 ) -> SegmentationResponse:
     if req.text_prompts is None:
         raise HTTPException(status_code=400, detail="text_prompts is required")
-    if not token:
-        raise HTTPException(status_code=400, detail="Token required to fetch image")
 
-    step_start = time.time()
-    raw_image = fetch_image_from_tapis(req.system_id, req.image_path, token)
-    print(f"Image Load: {time.time() - step_start:.4f}s")
+    raw_image = load_image()
 
     patch_size = req.get_effective_patch_size()
     if patch_size is not None:
@@ -168,25 +228,20 @@ async def _predict_with_text_batch(
 
 
 async def _predict_with_point(
-    req: SegmentationRequest, token: str, start_time: float
+    req: SegmentationRequest, load_image: ImageLoader, start_time: float
 ) -> SegmentationResponse:
     patch_size = req.get_effective_patch_size()
 
     if patch_size is not None:
-        return await _predict_point_cropped(req, token, start_time, patch_size)
-    return await _predict_point_cached(req, token, start_time)
+        return await _predict_point_cropped(req, load_image, start_time, patch_size)
+    return await _predict_point_cached(req, load_image, start_time)
 
 
 async def _predict_point_cropped(
-    req: SegmentationRequest, token: str, start_time: float, patch_size: int
+    req: SegmentationRequest, load_image: ImageLoader, start_time: float, patch_size: int
 ) -> SegmentationResponse:
     """Point inference on a center-cropped region (no embedding cache)."""
-    if not token:
-        raise HTTPException(
-            status_code=400, detail="Token required for crop-based point inference"
-        )
-
-    raw_image = fetch_image_from_tapis(req.system_id, req.image_path, token)
+    raw_image = load_image()
     if req.x is None or req.y is None:
         raise HTTPException(status_code=400, detail="Point coordinates are required")
     if req.x < 0 or req.y < 0 or req.x >= raw_image.width or req.y >= raw_image.height:
@@ -225,22 +280,14 @@ async def _predict_point_cropped(
 
 
 async def _predict_point_cached(
-    req: SegmentationRequest, token: str, start_time: float
+    req: SegmentationRequest, load_image: ImageLoader, start_time: float
 ) -> SegmentationResponse:
     """Point inference using cached image embeddings from Redis."""
     cache_key = f"{REDIS_EMBEDDING_KEY_PREFIX}:{req.pipe_id}_{req.image_id}"
     embedding_bytes = _load_valid_embedding(cache_key)
 
     if embedding_bytes is None:
-        if not token:
-            raise HTTPException(
-                status_code=400,
-                detail="Image missing from cache and no Token provided",
-            )
-        step_start = time.time()
-        raw_image = fetch_image_from_tapis(req.system_id, req.image_path, token)
-        print(f"Load Image: {time.time() - step_start:.4f}s")
-
+        raw_image = load_image()
         await encode_and_store_tracker_embeddings(req.image_id, req.pipe_id, raw_image)
         fresh = r.get(cache_key)
         if not isinstance(fresh, bytes):
@@ -307,6 +354,99 @@ async def _predict_point_cached(
         model="SAM3-Tracker",
         total_time_seconds=round(time.time() - start_time, 4),
     )
+
+
+@router.post("/predict_exemplar", response_model=SegmentationResponse)
+async def predict_exemplar(
+    req: ExemplarRequest,
+    token: str = Header(None, alias="token"),
+):
+    """Detect all objects similar to the supplied exemplar bounding box."""
+    start_time = time.time()
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Token required to fetch image")
+
+    try:
+        raw_image = fetch_image_from_tapis(req.system_id, req.image_path, token)
+
+        x1, y1, x2, y2 = req.exemplar_box
+        if x2 > raw_image.width or y2 > raw_image.height:
+            raise HTTPException(
+                status_code=400,
+                detail="exemplar_box extends outside image bounds",
+            )
+
+        if req.patch_size is not None:
+            tile_coords = build_overlapping_tiles(
+                raw_image.width, raw_image.height, req.patch_size, req.overlap_ratio
+            )
+            print(
+                f"Tiled exemplar inference: {len(tile_coords)} tiles, "
+                f"patch_size={req.patch_size}, overlap_ratio={req.overlap_ratio}"
+            )
+        else:
+            tile_coords = [(0, 0, raw_image.width, raw_image.height)]
+
+        candidates: list[dict] = []
+        label = f"exemplar({x1},{y1},{x2},{y2})"
+
+        for tx1, ty1, tx2, ty2 in tile_coords:
+            tile_img = raw_image.crop((tx1, ty1, tx2, ty2))
+
+            # Translate the exemplar box into tile-local coordinates and skip
+            # tiles that don't contain the exemplar at all.
+            local_ex1 = max(x1 - tx1, 0)
+            local_ey1 = max(y1 - ty1, 0)
+            local_ex2 = min(x2 - tx1, tx2 - tx1)
+            local_ey2 = min(y2 - ty1, ty2 - ty1)
+
+            if local_ex2 <= local_ex1 or local_ey2 <= local_ey1:
+                # Exemplar falls outside this tile — use full exemplar crop directly
+                local_exemplar_box = (x1, y1, x2, y2)
+                exemplar_source = raw_image
+            else:
+                local_exemplar_box = (local_ex1, local_ey1, local_ex2, local_ey2)
+                exemplar_source = tile_img
+
+            tile_dets = run_box_exemplar_inference_on_image(
+                tile_img,
+                exemplar_box=local_exemplar_box,
+                threshold=req.threshold,
+                mask_threshold=req.mask_threshold,
+            )
+            for bx1, by1, bx2, by2, score, seg_pts in tile_dets:
+                candidates.append(
+                    {
+                        "x_min": int(bx1 + tx1),
+                        "y_min": int(by1 + ty1),
+                        "x_max": int(bx2 + tx1),
+                        "y_max": int(by2 + ty1),
+                        "confidence": round(score, 4),
+                        "label": label,
+                        "prompt_index": 0,
+                        "segmentation": [[px + tx1, py + ty1] for px, py in seg_pts],
+                    }
+                )
+
+        merged = nms_bbox_candidates(candidates, iou_threshold=0.5)
+        bboxes = [BoundingBox(**b) for b in merged]
+        torch.cuda.empty_cache()
+
+        return SegmentationResponse(
+            bboxes=bboxes,
+            prompt_type="exemplar",
+            prompt_count=1,
+            total_detections=len(bboxes),
+            model="SAM3-Concept",
+            total_time_seconds=round(time.time() - start_time, 4),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Inference Error: {str(e)}")
 
 
 def _load_valid_embedding(cache_key: str) -> bytes | None:
